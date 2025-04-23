@@ -116,7 +116,7 @@ class ImmichClient:
         return None
 
     def upload_asset(
-        self, file_path: Path, album_id: Optional[str] = None
+        self, file_path: Path, album_id: Optional[str] = None, verbose=False
     ) -> Optional[str]:
         """Upload an asset to Immich.
 
@@ -135,7 +135,8 @@ class ImmichClient:
         if not mime_type:
             mime_type = "application/octet-stream"
 
-        console.print(f"Uploading: {file_path}")
+        if verbose:
+            console.print(f"Uploading: {file_path}")
         stats = os.stat(file_path)
         
         data = {
@@ -157,10 +158,6 @@ class ImmichClient:
                     f'{self.base_url}/assets', headers=self.headers, data=data, files=files
                 )
 
-                if response.status_code == 409:
-                    console.print(f"[yellow]Asset already exists:[/] {file_path}")
-                    return self._find_existing_asset_id(file_path.name)
-
                 response.raise_for_status()
                 asset_id = response.json().get("id")
 
@@ -173,22 +170,33 @@ class ImmichClient:
                 console.print(f"[bold red]Error uploading {file_path}:[/] {e}")
                 return None
 
-
-    def _find_existing_asset_id(self, filename: str) -> Optional[str]:
-        """Find an existing asset by filename.
-
-        This is a simplified implementation. For a real-world application,
-        you might want to search by more reliable means like checksum.
+    def add_assets_to_album(self, asset_ids: List[str], album_id: str) -> bool:
+        """Add a set of assets to an album.
 
         Args:
-            filename: The filename to search for.
+            asset_id: The ID of the asset to add.
+            album_id: The ID of the album to add the asset to.
 
         Returns:
-            The asset ID if found, None otherwise.
+            True if successful, False otherwise.
         """
-        # In a real implementation, you would call the search API
-        # This is a placeholder
-        return "existing-asset-id"
+        assert len(asset_ids) > 0, "No asset IDs provided"
+        assert album_id is not None, "No album ID provided"
+
+        if self.config.dry_run:
+            console.print(
+                f"[yellow]Would add assets to album:[/] {asset_ids} -> {album_id}"
+            )
+            return True
+
+        response = requests.put(
+            f"{self.base_url}/albums/{album_id}/assets",
+            headers=self.headers,
+            json={"ids": asset_ids},
+            timeout=30,
+        )
+        response.raise_for_status()
+        return True
 
     def add_asset_to_album(self, asset_id: str, album_id: str) -> bool:
         """Add an asset to an album.
@@ -200,17 +208,4 @@ class ImmichClient:
         Returns:
             True if successful, False otherwise.
         """
-        if self.config.dry_run:
-            console.print(
-                f"[yellow]Would add asset to album:[/] {asset_id} -> {album_id}"
-            )
-            return True
-
-        response = requests.put(
-            f"{self.base_url}/albums/{album_id}/assets",
-            headers=self.headers,
-            json={"ids": [asset_id]},
-            timeout=30,
-        )
-        response.raise_for_status()
-        return True
+        return self.add_assets_to_album([asset_id], album_id)

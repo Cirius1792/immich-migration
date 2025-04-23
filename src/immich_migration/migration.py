@@ -154,36 +154,45 @@ class PhotoMigration:
         with Progress() as progress:
             task = progress.add_task(f"Uploading to '{album_name}'", total=file_count)
 
-            if self.config.parallel_uploads <= 1:
-                # Upload sequentially
-                for file_path in media_files:
-                    self._upload_file(file_path, album_id)
+            # Upload in parallel
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=self.config.parallel_uploads
+            ) as executor:
+                # for file_path in media_files:
+                #     task_id = progress.add_task(
+                # Submit all upload tasks
+                futures = {
+                    executor.submit(
+                        self._upload_file, file_path
+                    ): file_path
+                    for file_path in media_files
+                }
+
+                uploaded_ids=[]
+
+                # Process results as they complete
+                for future in concurrent.futures.as_completed(futures):
+                    file_path = futures[future]
+                    try:
+                        uploaded_ids.append(future.result())
+                    except Exception as e:
+                        console.print(
+                            f"[bold red]Error uploading {file_path}:[/] {e}"
+                        )
                     progress.update(task, advance=1)
-            else:
-                # Upload in parallel
-                with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=self.config.parallel_uploads
-                ) as executor:
-                    # Submit all upload tasks
-                    futures = {
-                        executor.submit(
-                            self._upload_file, file_path, album_id
-                        ): file_path
-                        for file_path in media_files
-                    }
+                progress.stop() 
+                # Add the non null ids to the requested album:
+                if self.config.dry_run:
+                    console.print(
+                        f"[yellow]Would add assets to album:[/] {album_name} - {uploaded_ids}"
+                    )
+                else:
+                    # Add the uploaded assets to the album
+                    if uploaded_ids:
+                        console.print(f"[bold] Adding {len(uploaded_ids)} items to Album:[/] {album_name}")
+                        self.client.add_assets_to_album(uploaded_ids, album_id)
 
-                    # Process results as they complete
-                    for future in concurrent.futures.as_completed(futures):
-                        file_path = futures[future]
-                        try:
-                            future.result()
-                        except Exception as e:
-                            console.print(
-                                f"[bold red]Error uploading {file_path}:[/] {e}"
-                            )
-                        progress.update(task, advance=1)
-
-    def _upload_file(self, file_path: Path, album_id: str) -> Optional[str]:
+    def _upload_file(self, file_path: Path, album_id: Optional[str]=None) -> Optional[str]:
         """Upload a single file to Immich and add it to an album.
 
         Args:
