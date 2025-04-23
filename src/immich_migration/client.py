@@ -1,11 +1,12 @@
 """Immich API client."""
-
+import os
 import mimetypes
 from pathlib import Path
 from typing import List, Optional
+from datetime import datetime
 
 import requests
-from pydantic import BaseModel
+from pydantic import BaseModel, TypeAdapter
 from rich.console import Console
 
 from immich_migration.config import Config
@@ -41,7 +42,7 @@ class ImmichClient:
         """Verify connection to the Immich API."""
         try:
             response = requests.get(
-                f"{self.base_url}/server-info", headers=self.headers, timeout=10
+                f"{self.base_url}/server/about", headers=self.headers, timeout=10
             )
             response.raise_for_status()
             console.print("[green]Connected to Immich API successfully[/green]")
@@ -61,11 +62,11 @@ class ImmichClient:
         if self.config.dry_run:
             console.print(f"[yellow]Would create album:[/] {album_name}")
             # Return a mock album in dry-run mode
-            return Album(id="dry-run-id", albumName=album_name)
+            return Album(id='dry-run-id', albumName=album_name)
 
         console.print(f"Creating album: {album_name}")
         response = requests.post(
-            f"{self.base_url}/album",
+            f"{self.base_url}/albums",
             headers=self.headers,
             json={"albumName": album_name},
             timeout=30,
@@ -84,10 +85,16 @@ class ImmichClient:
             return []
             
         response = requests.get(
-            f"{self.base_url}/album", headers=self.headers, timeout=30
+            f"{self.base_url}/albums", headers=self.headers, timeout=30
         )
         response.raise_for_status()
-        return [Album.model_validate(album) for album in response.json()]
+        ta = TypeAdapter(List[Album])
+        try:
+            return ta.validate_python(response.json())
+        except Exception as e:
+            console.print(f"[bold red]Error validating albums:[/] {e}")
+            raise
+        # return [Album.model_validate(album) for album in response.json()]
 
     def find_album_by_name(self, album_name: str) -> Optional[Album]:
         """Find an album by name.
@@ -129,30 +136,43 @@ class ImmichClient:
             mime_type = "application/octet-stream"
 
         console.print(f"Uploading: {file_path}")
+        stats = os.stat(file_path)
+        
+        data = {
+            'deviceAssetId': f'{file_path}-{stats.st_mtime}',
+            'deviceId': 'python',
+            'fileCreatedAt': datetime.fromtimestamp(stats.st_mtime).isoformat(),
+            'fileModifiedAt': datetime.fromtimestamp(stats.st_mtime).isoformat(),
+            'isFavorite': 'false',
+            'albumId': album_id
+        }
 
-        with open(file_path, "rb") as f:
-            files = {"assetData": (file_path.name, f, mime_type)}
-            response = requests.post(
-                f"{self.base_url}/asset/upload",
-                headers={
-                    "x-api-key": self.config.api_key
-                },  # Don't include Accept header for multipart
-                files=files,
-                timeout=120,  # Longer timeout for uploads
-            )
+        with open(file_path, 'rb') as asset_data:
+            files = {
+                'assetData': asset_data
+            }
 
-        if response.status_code == 409:
-            console.print(f"[yellow]Asset already exists:[/] {file_path}")
-            return self._find_existing_asset_id(file_path.name)
+            try:
+                response = requests.post(
+                    f'{self.base_url}/assets', headers=self.headers, data=data, files=files
+                )
 
-        response.raise_for_status()
-        asset_id = response.json().get("id")
+                if response.status_code == 409:
+                    console.print(f"[yellow]Asset already exists:[/] {file_path}")
+                    return self._find_existing_asset_id(file_path.name)
 
-        # If album_id is provided, add the asset to the album
-        if asset_id and album_id:
-            self.add_asset_to_album(asset_id, album_id)
+                response.raise_for_status()
+                asset_id = response.json().get("id")
 
-        return asset_id
+                # If album_id is provided, add the asset to the album
+                if asset_id and album_id:
+                    self.add_asset_to_album(asset_id, album_id)
+
+                return asset_id
+            except requests.RequestException as e:
+                console.print(f"[bold red]Error uploading {file_path}:[/] {e}")
+                return None
+
 
     def _find_existing_asset_id(self, filename: str) -> Optional[str]:
         """Find an existing asset by filename.
@@ -187,9 +207,9 @@ class ImmichClient:
             return True
 
         response = requests.put(
-            f"{self.base_url}/album/{album_id}/assets",
+            f"{self.base_url}/albums/{album_id}/assets",
             headers=self.headers,
-            json={"assetIds": [asset_id]},
+            json={"ids": [asset_id]},
             timeout=30,
         )
         response.raise_for_status()
