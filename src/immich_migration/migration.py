@@ -99,12 +99,9 @@ class PhotoMigration:
             album_name = " - ".join(album_path) if album_path else directory.name
             self._upload_to_album(media_files, album_name)
 
-        # Process subdirectories
+        # Process subdirectories, ignoring the root folder in album naming
         for subdir, name in subdirs:
             new_parent_path = parent_path.copy()
-            if not new_parent_path:
-                # If we're at the root, use the root directory name
-                new_parent_path.append(directory.name)
             new_parent_path.append(name)
             self._process_directory(subdir, new_parent_path)
 
