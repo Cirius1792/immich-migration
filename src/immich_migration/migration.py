@@ -9,8 +9,13 @@ from rich.progress import Progress
 
 from immich_migration.client import ImmichClient
 from immich_migration.config import Config
+import json
+import os
 
 console = Console()
+
+# Filename for persisting asset upload checkpoint
+CHECKPOINT_FILENAME = ".immich-migration-checkpoint.json"
 
 # Image extensions we want to upload
 IMAGE_EXTENSIONS = {
@@ -62,6 +67,41 @@ class PhotoMigration:
         self.config = config
         self.client = ImmichClient(config)
         self.album_cache: Dict[str, str] = {}  # Map album name -> album ID
+    
+    @staticmethod
+    def _get_device_asset_id(file_path: Path) -> str:
+        """Compute the deviceAssetId string for a file."""
+        stats = file_path.stat()
+        return f"{file_path}-{stats.st_mtime}"
+    
+    def _load_checkpoint(self) -> None:
+        """Load checkpoint from disk, validating the Immich URL."""
+        if self.checkpoint_path.exists():
+            try:
+                with open(self.checkpoint_path, 'r') as f:
+                    data = json.load(f)
+                if data.get("immich_url") == self.config.immich_url and isinstance(data.get("assets"), dict):
+                    self.checkpoint = data
+                else:
+                    console.print("[yellow]Checkpoint server URL mismatch or corrupted; starting fresh[/yellow]")
+                    self.checkpoint = {"immich_url": self.config.immich_url, "assets": {}}
+            except Exception as e:
+                console.print(f"[bold red]Error loading checkpoint file:[/] {e}")
+                self.checkpoint = {"immich_url": self.config.immich_url, "assets": {}}
+        else:
+            self.checkpoint = {"immich_url": self.config.immich_url, "assets": {}}
+    
+    def _save_checkpoint(self) -> None:
+        """Persist checkpoint to disk atomically."""
+        if self.config.dry_run:
+            return
+        try:
+            tmp_path = self.checkpoint_path.parent / (self.checkpoint_path.name + ".tmp")
+            with open(tmp_path, 'w') as f:
+                json.dump(self.checkpoint, f)
+            os.replace(tmp_path, self.checkpoint_path)
+        except Exception as e:
+            console.print(f"[bold red]Error saving checkpoint file:[/] {e}")
 
     def migrate(self, root_dir: Path) -> None:
         """Migrate photos from root directory to Immich.
@@ -73,8 +113,14 @@ class PhotoMigration:
         if self.config.dry_run:
             console.print("[yellow]DRY RUN MODE: No changes will be made[/yellow]")
 
-        # Process the root directory
-        self._process_directory(root_dir, [])
+        # Prepare checkpoint file path and load existing data
+        self.checkpoint_path = root_dir / CHECKPOINT_FILENAME
+        self._load_checkpoint()
+        # Process the root directory, then persist checkpoint
+        try:
+            self._process_directory(root_dir, [])
+        finally:
+            self._save_checkpoint()
 
     def _process_directory(self, directory: Path, parent_path: List[str]) -> None:
         """Process a directory, creating albums and uploading photos.
@@ -135,59 +181,61 @@ class PhotoMigration:
         return "dry-run-album-id"
 
     def _upload_to_album(self, media_files: List[Path], album_name: str) -> None:
-        """Upload media files to an album.
+        """Upload media files to an album, skipping already-uploaded assets.
 
         Args:
             media_files: List of media files to upload.
             album_name: Name of the album to upload to.
         """
         album_id = self._get_or_create_album(album_name)
-        file_count = len(media_files)
+        total_files = len(media_files)
 
         console.print(f"[bold]Album:[/] {album_name}")
-        console.print(f"[bold]Found[/] {file_count} media files to upload")
+        console.print(f"[bold]Found[/] {total_files} media files to upload or skip")
 
-        # Use a progress bar for the uploads
+        # Partition files into already-uploaded and new uploads
+        skipped_ids: List[str] = []
+        to_upload: List[Tuple[Path, str]] = []
+        for file_path in media_files:
+            device_id = self._get_device_asset_id(file_path)
+            server_id = self.checkpoint.get("assets", {}).get(device_id)
+            if server_id:
+                skipped_ids.append(server_id)
+            else:
+                to_upload.append((file_path, device_id))
+
+        new_ids: List[str] = []
+        # Upload new files with progress
         with Progress() as progress:
-            task = progress.add_task(f"Uploading to '{album_name}'", total=file_count)
-
-            # Upload in parallel
+            task = progress.add_task(f"Uploading to '{album_name}'", total=len(to_upload))
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=self.config.parallel_uploads
             ) as executor:
-                # for file_path in media_files:
-                #     task_id = progress.add_task(
-                # Submit all upload tasks
                 futures = {
-                    executor.submit(
-                        self._upload_file, file_path
-                    ): file_path
-                    for file_path in media_files
+                    executor.submit(self._upload_file, file_path, album_id): (file_path, device_id)
+                    for file_path, device_id in to_upload
                 }
-
-                uploaded_ids=[]
-
-                # Process results as they complete
                 for future in concurrent.futures.as_completed(futures):
-                    file_path = futures[future]
+                    file_path, device_id = futures[future]
                     try:
-                        uploaded_ids.append(future.result())
+                        server_id = future.result()
+                        if server_id:
+                            # record in checkpoint
+                            self.checkpoint.setdefault("assets", {})[device_id] = server_id
+                            new_ids.append(server_id)
                     except Exception as e:
-                        console.print(
-                            f"[bold red]Error uploading {file_path}:[/] {e}"
-                        )
-                    progress.update(task, advance=1)
-                progress.stop() 
-                # Add the non null ids to the requested album:
-                if self.config.dry_run:
-                    console.print(
-                        f"[yellow]Would add assets to album:[/] {album_name} - {uploaded_ids}"
-                    )
-                else:
-                    # Add the uploaded assets to the album
-                    if uploaded_ids:
-                        console.print(f"[bold] Adding {len(uploaded_ids)} items to Album:[/] {album_name}")
-                        self.client.add_assets_to_album(uploaded_ids, album_id)
+                        console.print(f"[bold red]Error uploading {file_path}:[/] {e}")
+                    finally:
+                        progress.update(task, advance=1)
+            progress.stop()
+
+        all_ids = skipped_ids + new_ids
+        if self.config.dry_run:
+            console.print(f"[yellow]Would add assets to album:[/] {album_name} - {all_ids}")
+        else:
+            if all_ids:
+                console.print(f"[bold]Adding {len(all_ids)} items to Album:[/] {album_name}")
+                self.client.add_assets_to_album(all_ids, album_id)
 
     def _upload_file(self, file_path: Path, album_id: Optional[str]=None) -> Optional[str]:
         """Upload a single file to Immich and add it to an album.
